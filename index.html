@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>BTCUSDT NUCLEAR SMC vC (Refined SMC + Liquidity)</title>
+  <style>
+    :root { --bg:#0b0c0f; --card:#111216; --accent:#06f; --good:#064; --bad:#600; --muted:#9aa; color-scheme: dark; }
+    body{ background:var(--bg); color:#fff; font-family:Inter, system-ui, Arial; padding:20px; margin:0; }
+    .wrap{ max-width:900px; margin:0 auto; }
+    h1{ margin:0 0 8px 0; font-size:20px; }
+    p.small{ color:var(--muted); margin:6px 0 16px 0; }
+    label{ font-size:13px; color:var(--muted); display:block; margin-top:8px; }
+    input{ width:100%; padding:10px; border-radius:8px; border:1px solid #222; background:var(--card); color:#fff; margin-top:6px; }
+    button{ padding:10px 14px; border-radius:8px; border:none; background:var(--accent); color:#fff; cursor:pointer; margin:8px 6px 8px 0; }
+    button.stop{ background:#c33; }
+    .status{ padding:10px; background:#0d0f12; border-radius:8px; margin-top:12px; }
+    .signalBox{ padding:12px; margin-top:12px; border-radius:8px; display:none; color:white; }
+    .logs{ background:#000; color:#0f0; padding:10px; height:350px; overflow:auto; border-radius:6px; margin-top:12px; font-family:monospace; white-space:pre-wrap; }
+    .infoRow{ display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
+    .chip{ background:#0d0f12; padding:6px 10px; border-radius:8px; color:var(--muted); font-size:13px; }
+    small{ color:var(--muted); }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>BTCUSDT NUCLEAR SMC vC</h1>
+  <p class="small">Refined SMC + Liquidity Grab + MSS + Volume. 8 indicators → 5/8 Early Signal → 6+ Strong Signal.</p>
+
+  <label>Telegram Bot Token</label>
+  <input id="tg_token" placeholder="123456:ABC...">
+
+  <label>Chat IDs (comma separated)</label>
+  <input id="tg_chats" placeholder="12345678,-1001234567890">
+
+  <div class="infoRow">
+    <button id="startBtn">Start Bot</button>
+    <button id="stopBtn" class="stop">Stop Bot</button>
+    <div class="chip" id="runStatus">Status: Stopped</div>
+    <div class="chip" id="lastSignal">Last Signal: —</div>
+  </div>
+
+  <div id="signal" class="signalBox"></div>
+
+  <div class="status" id="summary">Config: BTC • 15m/1h/4h • 1-min scheduler</div>
+
+  <div class="logs" id="logs"></div>
+</div>
+
+<script>
+
+/* ------------------------------
+      NUCLEAR SMC UPDATED BUILD
+      BUY / SELL TEXT ADDED
+   ------------------------------ */
+
+const SYMBOL = "BTCUSDT";
+const API = "https://api.binance.com";
+const SCAN_MS = 60000;
+const COOLDOWN_MS = 3600000;
+
+let loopId = null;
+let running = false;
+let lastSignalTime = 0;
+
+// DOM
+const logsEl = document.getElementById("logs");
+const statusEl = document.getElementById("runStatus");
+const lastSignalEl = document.getElementById("lastSignal");
+const signalBox = document.getElementById("signal");
+
+function log(msg){
+  const t = new Date().toLocaleTimeString();
+  logsEl.innerText += `[${t}] ${msg}\n`;
+  logsEl.scrollTop = logsEl.scrollHeight;
+}
+
+function fmt(n, d=2){ return Number(n).toFixed(d); }
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+
+/* ---------------- FETCH KLInES ---------------- */
+async function getKlines(interval, limit){
+  const url = `${API}/api/v3/klines?symbol=${SYMBOL}&interval=${interval}&limit=${limit}`;
+  try{
+    const r = await fetch(url);
+    const j = await r.json();
+    return j.map(k=>({ o:+k[1], h:+k[2], l:+k[3], c:+k[4], v:+k[5] }));
+  }catch{
+    return [];
+  }
+}
+
+/* ---------------- ATR ---------------- */
+function ATR(c, p=14){
+  if(c.length < p+2) return 0;
+  let trs=[];
+  for(let i=1;i<c.length;i++){
+    trs.push(Math.max(c[i].h-c[i].l, Math.abs(c[i].h-c[i-1].c), Math.abs(c[i].l-c[i-1].c)));
+  }
+  let atr = trs.slice(0,p).reduce((a,b)=>a+b,0)/p;
+  for(let i=p;i<trs.length;i++){
+    atr = (atr*(p-1)+trs[i])/p;
+  }
+  return atr;
+}
+
+/* ---------------- OB ---------------- */
+function detectOB(c){
+  let bull=null, bear=null;
+  for(let i=3;i<c.length-2;i++){
+    const p=c[i-1], x=c[i];
+    if(p.c<p.o && x.c>x.o && x.c>p.h && x.l<=p.l) bull={price:p.l};
+    if(p.c>p.o && x.c<x.o && x.c<p.l && x.h>=p.h) bear={price:p.h};
+  }
+  return {bull,bear};
+}
+
+/* ---------------- FVG ---------------- */
+function detectFVG(c){
+  for(let i=2;i<c.length;i++){
+    const a=c[i-2], b=c[i];
+    if(a.h<b.l) return "bull";
+    if(a.l>b.h) return "bear";
+  }
+  return null;
+}
+
+/* ---------------- Volume Spike ---------------- */
+function volSpike(c){
+  const last=c[c.length-1].v;
+  const avg=c.slice(-11,-1).reduce((s,x)=>s+x.v,0)/10;
+  return last > avg*2.2;
+}
+
+/* ---------------- 4H BIAS ---------------- */
+function trendBias(h4){
+  const closes = h4.map(x=>x.c);
+  const sma20 = closes.slice(-21,-1).reduce((a,b)=>a+b,0)/20;
+  const last = closes[closes.length-1];
+  if(last > sma20) return "bull";
+  if(last < sma20) return "bear";
+  return "neutral";
+}
+
+/* ---------------- MSS ---------------- */
+function detectMSS(c){
+  if(c.length < 40) return null;
+  const last = c[c.length-1];
+  let swingH=-1e9, swingL=1e9;
+  for(let i=c.length-30;i<c.length;i++){
+    if(c[i].h>swingH) swingH=c[i].h;
+    if(c[i].l<swingL) swingL=c[i].l;
+  }
+  if(last.h>swingH && last.c<last.o) return "mss_bull_break";
+  if(last.l<swingL && last.c>last.o) return "mss_bear_break";
+  return null;
+}
+
+/* ---------------- Liquidity Grab ---------------- */
+function liquidityGrab(c){
+  if(c.length<30) return {top:false,bottom:false,volOk:false};
+  const atr=ATR(c,14);
+  let swingH=-1e9, swingL=1e9;
+  for(let i=c.length-20;i<c.length;i++){
+    if(c[i].h>swingH) swingH=c[i].h;
+    if(c[i].l<swingL) swingL=c[i].l;
+  }
+  const x=c[c.length-1];
+  const wickTop=x.h-Math.max(x.c,x.o);
+  const wickBottom=Math.min(x.c,x.o)-x.l;
+
+  const v = volSpike(c);
+
+  return {
+    top: x.h>swingH && wickTop>atr*1.1 && x.c<x.o && v,
+    bottom: x.l<swingL && wickBottom>atr*1.1 && x.c>x.o && v,
+    volOk: v
+  };
+}
+
+/* ---------------- MAIN SCAN ---------------- */
+async function scan(){
+  const [m15,h1,h4] = await Promise.all([
+    getKlines("15m",200),
+    getKlines("1h",200),
+    getKlines("4h",120)
+  ]);
+
+  if(m15.length<40) return log("Not enough candles");
+
+  const price = m15[m15.length-1].c;
+
+  const ob15 = detectOB(m15.slice(-80));
+  const ob1h = detectOB(h1.slice(-80));
+  const fvg = detectFVG(m15.slice(-30));
+  const vsp = volSpike(m15);
+  const bias = trendBias(h4);
+  const mss = detectMSS(m15);
+  const liq = liquidityGrab(m15);
+
+  // 8 indicators
+  const ind1 = !!ob15.bull || !!ob15.bear;
+  const ind2 = !!ob1h.bull || !!ob1h.bear;
+  const ind3 = !!fvg;
+  const ind4 = vsp;
+  const ind5 = bias !== "neutral";
+  const ind6 = false; // ATR shift removed (useless)
+  const ind7 = !!mss;
+  const ind8 = (liq.top || liq.bottom) && liq.volOk;
+
+  const confirmed = [ind1,ind2,ind3,ind4,ind5,ind6,ind7,ind8].filter(x=>x).length;
+
+  /* ----------- LOGS ----------- */
+  log(
+`--------------------------
+Price: ${fmt(price)}
+Confirmed: ${confirmed}/8
+OB 15m:      ${ind1}
+OB 1h:       ${ind2}
+FVG:         ${ind3}
+VolumeSpike: ${ind4}
+4H Bias:     ${bias}
+MSS:         ${mss || "none"}
+Liquidity:   top:${liq.top} bottom:${liq.bottom}
+--------------------------`
+  );
+
+  /* ----------- COOLDOWN ----------- */
+  if(Date.now() - lastSignalTime < COOLDOWN_MS) return;
+
+  /* ----------- SIGNAL ----------- */
+  if(confirmed >= 5){
+
+    const strength = confirmed === 5 ? "⚠ EARLY SIGNAL (5/8)" : "🔥 STRONG SIGNAL (6+/8)";
+
+    let direction = "BUY"; // BUY = Long
+    if(liq.top) direction="SELL";
+    else if(mss?.includes("bear")) direction="SELL";
+    else if(bias==="bear") direction="SELL";
+
+    const entry = price;
+    const atr15 = ATR(m15,14);
+    const sl = direction==="BUY" ? entry-(atr15*1.2) : entry+(atr15*1.2);
+    const tp = direction==="BUY" ? entry+(entry-sl)*4 : entry-(sl-entry)*4;
+
+    const msg =
+`<b>BTCUSDT NUCLEAR SMC vC</b>
+${strength}
+
+<b>Signal:</b> ${direction}
+Entry: <b>${fmt(entry)}</b>
+SL: <b>${fmt(sl)}</b>
+TP: <b>${fmt(tp)}</b>
+
+Confirmed: ${confirmed}/8
+Time: ${new Date().toLocaleString()}`;
+
+    await sendTG(msg);
+
+    lastSignalTime = Date.now();
+    lastSignalEl.innerText = "Last Signal: " + new Date().toLocaleTimeString();
+
+    signalBox.style.display="block";
+    signalBox.style.background = direction==="BUY" ? "#063" : "#600";
+    signalBox.innerHTML = msg.replace(/\n/g,"<br>");
+
+    log(`SIGNAL SENT → ${direction}`);
+  }
+}
+
+/* ---------------- TELEGRAM ---------------- */
+async function sendTG(msg){
+  const token = document.getElementById("tg_token").value.trim();
+  const chats = document.getElementById("tg_chats").value.trim().split(",");
+
+  for(const id of chats){
+    try{
+      await fetch(
+        `https://api.telegram.org/bot${token}/sendMessage?chat_id=${id}&text=${encodeURIComponent(msg)}&parse_mode=HTML`
+      );
+    }catch(e){
+      log("TG Error: "+e);
+    }
+    await sleep(150);
+  }
+}
+
+/* ---------------- CONTROLS ---------------- */
+document.getElementById("startBtn").onclick = ()=>{
+  if(running) return;
+  running=true;
+  statusEl.innerText = "Status: Running";
+  log("Bot started");
+  scan();
+  loopId = setInterval(scan, SCAN_MS);
+};
+
+document.getElementById("stopBtn").onclick = ()=>{
+  clearInterval(loopId);
+  running=false;
+  statusEl.innerText = "Status: Stopped";
+  log("Bot stopped");
+};
+
+</script>
+</body>
+</html>
